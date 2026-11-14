@@ -51,11 +51,19 @@
 //   Neighbouring parameters (confirm 70-80 bps, target 110-130 bps,
 //   trailing stop 100-150 bps, timeout >= 240 bars) all stay positive, so
 //   the edge is a plateau, not a knife-edge threshold. Target 150 bps
-//   scores a little higher on dev (+$19.26) but two of its three exits
-//   are 240-bar timeouts, and moving the timeout to 180 or 300 bars
-//   halves it: that is a clock tuned to this window's recovery lengths,
-//   not a price edge, so it is not used. The 120 bps target exits on
-//   price in all three completed dev trades.
+//   scores a little higher on dev (+$19.26, or +$26.45 with the
+//   no-late-buys rule) but two of its three exits are 240-bar timeouts,
+//   and moving the timeout to 180 or 300 bars halves it: that is a
+//   clock tuned to this window's recovery lengths, not a price edge,
+//   so it is not used. The 120 bps target exits on price in all three
+//   completed dev trades, and is flat across timeouts >= 240 bars and
+//   trailing stops of 75-150 bps.
+//
+// No-late-buys (scored bar >= 1200, only after a buy has filled):
+// dev net +$17.76 -> +$25.44, 2x-fee +$12.91 -> +$21.77, max
+// drawdown 0.79% -> 0.74%, 3 round trips, all three exits on target.
+// The skipped fourth buy (bar 1342) is the only change on the dev
+// window. Cutoffs 1080-1320 all give the same dev result.
 //
 // Late-day fallback (live-race insurance, never fires on the dev window
 // because the first buy fills at bar 403, so the dev grade is unchanged):
@@ -83,6 +91,15 @@ const TRAIL_BPS = 100; // trailing stop 1.0% below the peak close since entry
 const MAX_HOLD_BARS = 240; // give a recovery up to 4 hours, then exit
 const REF_BARS = 360; // trailing-high lookback, in bars
 const MAX_SLIPPAGE_BPS = 100;
+// No new buys after scored bar 1200 while a buy has already filled:
+// 1200 = 1440 - 240, so a buy then still has its full 4-hour hold
+// inside the window. A later buy can only be flattened at the close
+// before any recovery has time to form: on the dev window the buy at
+// bar 1342 (fourth dip, recovery only +0.27%) loses $7.67 on the
+// flatten. Any cutoff from 1080 to 1320 gives the same dev result;
+// 1200 is the principled one, not a fitted one. This does not touch
+// the late-day fallback below, which only applies while buys == 0.
+const NOLATE_BAR = 1200;
 // Late-day fallback entry (only while no buy has filled yet):
 const FALLBACK1_BAR = 1000; // from here: 2.5% dip + 60 bps bounce
 const FALLBACK1_BPS = 250;
@@ -168,6 +185,13 @@ await runBars({
 
     // Flat: look for a deep drawdown against either reference level.
     if (state.warmingUp || dayOpen === null) return [];
+    // scoredBar counts scored bars only, so warm-up batches do not move
+    // the late-window schedule (fallback stages and the no-late-buys
+    // cutoff below both read it).
+    const scoredBar = state.seq - state.warmupBars;
+    // No new buys in the last 240 bars once a buy has already filled
+    // (see NOLATE_BAR). The buys == 0 fallback below still applies.
+    if (scoredBar >= NOLATE_BAR && buys > 0) return [];
     let deepest = drawdownBps(close, dayOpen);
     let high = closes[0]!;
     for (const c of closes) if (c > high) high = c;
@@ -184,9 +208,7 @@ await runBars({
     }
     // Shallow dip: track the low while dipped, buy on a bounce. The entry
     // thresholds relax late in the window while no buy has filled yet
-    // (see the fallback note in the header): scoredBar counts scored
-    // bars only, so warm-up batches do not move the schedule.
-    const scoredBar = state.seq - state.warmupBars;
+    // (see the fallback note in the header).
     let shallowBps = SHALLOW_BPS;
     let confirmBps = CONFIRM_BPS;
     let immediate = false;

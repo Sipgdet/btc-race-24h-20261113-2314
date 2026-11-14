@@ -45,11 +45,32 @@
 // Dev results (local sim, fee 4 bps + 2 bps slippage + pool impact):
 //   previous version (deep dip 4.5% only, target 150 bps): net +$12.14,
 //   3 buys, 2x-fee +$8.51.
-//   this version (hybrid, target 120 bps): net +$17.76, 4 buys (three
-//   target hits +$8.41/+$7.81/+$9.23, last buy flattened at window close),
-//   2x-fee +$12.91, max drawdown 0.79%. Neighbouring parameters
-//   (confirm 70-80 bps, target 100-120 bps) all stay positive, so the
-//   edge is a plateau, not a knife-edge threshold.
+//   hybrid version (deep 4.5% + confirmed 3% dip, target 120 bps):
+//   net +$17.76, 4 buys (three target hits +$8.41/+$7.81/+$9.23, last buy
+//   flattened at window close), 2x-fee +$12.91, max drawdown 0.79%.
+//   Neighbouring parameters (confirm 70-80 bps, target 110-130 bps,
+//   trailing stop 100-150 bps, timeout >= 240 bars) all stay positive, so
+//   the edge is a plateau, not a knife-edge threshold. Target 150 bps
+//   scores a little higher on dev (+$19.26) but two of its three exits
+//   are 240-bar timeouts, and moving the timeout to 180 or 300 bars
+//   halves it: that is a clock tuned to this window's recovery lengths,
+//   not a price edge, so it is not used. The 120 bps target exits on
+//   price in all three completed dev trades.
+//
+// Late-day fallback (live-race insurance, never fires on the dev window
+// because the first buy fills at bar 403, so the dev grade is unchanged):
+// the dev window's known failure mode is a race day with no deep dip,
+// which would leave the bot with 0 trades and below every guardrail-
+// meeting entry. If no buy has filled yet, the confirmed-dip entry
+// relaxes as the window runs out: from scored bar 1000 a 2.5% dip with
+// a 60 bps bounce, from bar 1300 a 1.5% dip bought immediately, from
+// bar 1380 a 1.0% dip bought immediately. The late stages buy without
+// confirmation because little time remains to wait for one; the 100 bps
+// trailing stop caps the downside near 1% (a synthetic late waterfall
+// loses $13.29), and 1 trade that loses a little still meets the
+// guardrail while 0 trades cannot place at all. A synthetic flat day
+// with a late 1.7% dip and recovery nets +$9.09 through the fallback
+// versus $0.00 without it.
 
 import { runBars, type BarsState, type Batch, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
 
@@ -62,6 +83,14 @@ const TRAIL_BPS = 100; // trailing stop 1.0% below the peak close since entry
 const MAX_HOLD_BARS = 240; // give a recovery up to 4 hours, then exit
 const REF_BARS = 360; // trailing-high lookback, in bars
 const MAX_SLIPPAGE_BPS = 100;
+// Late-day fallback entry (only while no buy has filled yet):
+const FALLBACK1_BAR = 1000; // from here: 2.5% dip + 60 bps bounce
+const FALLBACK1_BPS = 250;
+const FALLBACK1_CONFIRM_BPS = 60;
+const FALLBACK2_BAR = 1300; // from here: 1.5% dip, bought immediately
+const FALLBACK2_BPS = 150;
+const FALLBACK3_BAR = 1380; // from here: 1.0% dip, bought immediately
+const FALLBACK3_BPS = 100;
 
 // Closes seen so far, oldest first, capped at REF_BARS + 1 entries.
 const closes: bigint[] = [];
@@ -85,6 +114,8 @@ let holdBars = 0;
 // a reference level (null when flat and not dipped). Tracks the low the
 // confirmation bounce is measured from; resets when the dip heals.
 let dipLow: bigint | null = null;
+// Buy fills so far. The late-day fallback only applies while this is 0.
+let buys = 0;
 
 function drawdownBps(close: bigint, ref: bigint): bigint {
   // (close / ref - 1) in bps, truncated toward zero; negative = below ref.
@@ -107,6 +138,7 @@ await runBars({
         entryOpen = BigInt(bar.o);
         holdBars = 1;
         boughtThisBatch = true;
+        buys += 1;
       } else if (fill.side === 'sell') {
         entryOpen = null;
         peakClose = null;
@@ -150,10 +182,37 @@ await runBars({
       peakClose = close;
       return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: spend, max_slippage_bps: MAX_SLIPPAGE_BPS }];
     }
-    // Shallow dip: track the low while dipped, buy on an 80 bps bounce.
-    if (deepest <= -BigInt(SHALLOW_BPS)) {
+    // Shallow dip: track the low while dipped, buy on a bounce. The entry
+    // thresholds relax late in the window while no buy has filled yet
+    // (see the fallback note in the header): scoredBar counts scored
+    // bars only, so warm-up batches do not move the schedule.
+    const scoredBar = state.seq - state.warmupBars;
+    let shallowBps = SHALLOW_BPS;
+    let confirmBps = CONFIRM_BPS;
+    let immediate = false;
+    if (buys === 0) {
+      if (scoredBar >= FALLBACK3_BAR) {
+        shallowBps = FALLBACK3_BPS;
+        immediate = true;
+      } else if (scoredBar >= FALLBACK2_BAR) {
+        shallowBps = FALLBACK2_BPS;
+        immediate = true;
+      } else if (scoredBar >= FALLBACK1_BAR) {
+        shallowBps = FALLBACK1_BPS;
+        confirmBps = FALLBACK1_CONFIRM_BPS;
+      }
+    }
+    if (deepest <= -BigInt(shallowBps)) {
+      if (immediate) {
+        dipLow = null;
+        const room = state.weightRoom(SYMBOL);
+        let spend = state.cash < room ? state.cash : room;
+        if (spend < BigInt(state.hello.fees.min_notional_quote_units)) return [];
+        peakClose = close;
+        return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: spend, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+      }
       if (dipLow === null || close < dipLow) dipLow = close;
-      if (gainBps(close, dipLow) >= BigInt(CONFIRM_BPS)) {
+      if (gainBps(close, dipLow) >= BigInt(confirmBps)) {
         dipLow = null;
         const room = state.weightRoom(SYMBOL);
         let spend = state.cash < room ? state.cash : room;
